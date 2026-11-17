@@ -22,13 +22,15 @@ export const viewer = scenario.viewer.login;
 export const token = process.env.MAKEFUN_SHOP_TOKEN || '';
 export const now = process.env.MAKEFUN_TRIAL_NOW || '2025-01-01T00:00:00Z';
 export const repositories = new Map<string, Repository>();
-let nextId = 1;
+let nextId = scenario.repos.length + 1;
 export const keyOf = (owner: string, name: string) => (owner || '').toLowerCase() + '/' + (name || '').toLowerCase();
 export const getRepo = (owner: string, name: string) => repositories.get(keyOf(owner, name));
 
 export function makeRepo(owner: string, name: string, options: any = {}): Repository {
   const repo: Repository = {
-    owner, name, id: nextId++, description: options.description || '', private: !!options.private,
+    // Seeded fixtures bring stable public IDs, so they should not consume the serial IDs used for
+    // repositories created through the API.
+    owner, name, id: options.id ?? nextId++, description: options.description || '', private: !!options.private,
     refs: new Map(), objects: new Map(), branches: new Map(), issues: [], pulls: [], labels: [],
     comments: new Map(), files: new Map(),
   };
@@ -37,7 +39,6 @@ export function makeRepo(owner: string, name: string, options: any = {}): Reposi
 }
 
 export function allocateId(): number { return nextId++; }
-export function setNextId(value: number): void { nextId = value; }
 export const contentHash = (value: Buffer | string) => createHash('sha1').update(value).digest('hex');
 
 export function listFiles(repo: Repository, tree: string, prefix = '', output = new Map<string, string>()): Map<string, string> {
@@ -67,7 +68,13 @@ export function buildTree(repo: Repository, files: Map<string, string>): string 
     }
   }
   for (const [name, children] of directories) entries.push({ name, sha: buildTree(repo, children), mode: '40000' });
-  entries.sort((left, right) => left.name.localeCompare(right.name));
+  // Git compares directory names as if they ended in '/', which changes ordering against files
+  // sharing the same prefix (for example, `foo.bar` sorts before directory `foo/`).
+  entries.sort((left, right) => {
+    const leftName = left.name + (left.mode === '40000' ? '/' : '');
+    const rightName = right.name + (right.mode === '40000' ? '/' : '');
+    return leftName < rightName ? -1 : leftName > rightName ? 1 : 0;
+  });
   const data = Buffer.concat(entries.map((entry) => Buffer.concat([Buffer.from(entry.mode + ' ' + entry.name + '\0'), Buffer.from(entry.sha, 'hex')])));
   const sha = gitObjectHash('tree', data); repo.objects.set(sha, { type: 'tree', data }); return sha;
 }
@@ -128,11 +135,8 @@ export function createPull(repo: Repository, body: any): PullRequest {
 
 function seedRepositories(): void {
   for (const seed of scenario.repos) {
-    const repo = makeRepo(viewer, seed.name, { description: seed.description });
-    repo.id = seed.id;
+    const repo = makeRepo(viewer, seed.name, { id: seed.id, description: seed.description });
     (repo as Repository & { default_branch?: string }).default_branch = seed.defaultBranch;
   }
-  // makeRepo consumed one serial for each seed; seeded public IDs do not move that counter.
-  setNextId(scenario.repos.length + 1);
 }
 seedRepositories();

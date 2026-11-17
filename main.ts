@@ -6,7 +6,9 @@ const firstRetry = 250;
 const retryCap = 2_000;
 
 const pause = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
-const retryAfter = (attempt: number) => Math.min(retryCap, firstRetry * 2 ** Math.min(attempt, 8));
+const retryExponentCap = Math.ceil(Math.log2(retryCap / firstRetry));
+const retryAfter = (attempt: number) => firstRetry * 2 ** Math.min(attempt, retryExponentCap);
+class RegisterRejectedError extends Error {}
 
 async function registerPort(port: number): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
@@ -18,11 +20,11 @@ async function registerPort(port: number): Promise<void> {
         signal: AbortSignal.timeout(timeout),
       });
       if (response.status === 200 || response.status === 409) return;
-      if (response.status === 400 || response.status === 405) {
-        throw new Error('register answered HTTP ' + response.status + ': ' + await response.text());
+      if (response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429) {
+        throw new RegisterRejectedError('register answered HTTP ' + response.status + ': ' + await response.text());
       }
     } catch (error) {
-      if (error instanceof Error && error.message.startsWith('register answered HTTP ')) throw error;
+      if (error instanceof RegisterRejectedError) throw error;
     }
     await pause(retryAfter(attempt));
   }
@@ -51,11 +53,14 @@ async function runEntry(): Promise<void> {
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
   process.stdout.write('[entry] listening on port ' + address.port + '\n');
-  await registerPort(address.port);
-  process.stdout.write('[entry] registered; waiting for the env to say done\n');
-  await awaitCompletion();
-  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-  process.stdout.write('[entry] done\n');
+  try {
+    await registerPort(address.port);
+    process.stdout.write('[entry] registered; waiting for the env to say done\n');
+    await awaitCompletion();
+    process.stdout.write('[entry] done\n');
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 }
 
 try {

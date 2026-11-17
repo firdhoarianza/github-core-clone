@@ -7,14 +7,16 @@ import { getRepo, token, viewer } from './lib/store.ts';
 
 const jsonHeaders = (response: ServerResponse, status: number, body: any, extra: Record<string, string> = {}): void => {
   const serialized = status === 204 ? '' : JSON.stringify(body);
-  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...extra,
+  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'x-github-request-id': nextRequestId(), ...extra,
     ...(serialized ? { 'content-length': Buffer.byteLength(serialized) } : {}) });
   response.end(serialized);
 };
 const sendError = (response: ServerResponse, status: number, message: string): void => jsonHeaders(response, status, { message });
 const sendBuffer = (response: ServerResponse, status: number, type: string, body: Buffer): void => {
-  response.writeHead(status, { 'content-type': type, 'content-length': body.length }); response.end(body);
+  response.writeHead(status, { 'content-type': type, 'content-length': body.length, 'x-github-request-id': nextRequestId() }); response.end(body);
 };
+let requestSequence = 0;
+function nextRequestId(): string { return 'forge-' + (++requestSequence).toString(36); }
 
 function requestBody(request: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve) => {
@@ -78,7 +80,7 @@ function apiRoute(request: IncomingMessage, response: ServerResponse, url: URL):
     }
     const body = parsed.value;
     if (isGraphql) jsonHeaders(response, 200, handleGraphqlBody(body));
-    else if (!Array.isArray(body) && body?.method === 'notifications/initialized') response.writeHead(202).end();
+    else if (!Array.isArray(body) && body?.method === 'notifications/initialized') response.writeHead(202, { 'x-github-request-id': nextRequestId() }).end();
     else jsonHeaders(response, 200, handleMcpBody(body, viewer));
     return true;
   });

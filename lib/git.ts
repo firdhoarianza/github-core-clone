@@ -178,7 +178,13 @@ function receivePack(repo: Repository, body: Buffer): Buffer {
     if (length < 4 || offset + length - 4 > body.length) { offset -= 4; break; }
     const line = body.subarray(offset, offset + length - 4).toString().split('\0')[0]!.trim(); if (line) commands.push(line.split(' ')); offset += length - 4;
   }
-  const incoming = body.length - offset > 20 ? readPack(body.subarray(offset)) : new Map<string, ObjectValue>();
+  let incoming: Map<string, ObjectValue>;
+  try {
+    incoming = body.length - offset > 20 ? readPack(body.subarray(offset)) : new Map<string, ObjectValue>();
+  } catch {
+    const status = Buffer.concat([pkt('unpack error\n'), flush()]);
+    return Buffer.concat([pkt(Buffer.concat([Buffer.from([1]), status])), flush()]);
+  }
   for (const [sha, object] of incoming) repo.objects.set(sha, object);
   const report = ['unpack ok'];
   for (const [oldSha, newSha, ref] of commands) {

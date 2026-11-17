@@ -1,10 +1,10 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
-  addIssue, allocateId, buildTree, contentHash, createPull, getRepo, issueJson, keyOf, listFiles,
+  addIssue, allocateId, buildTree, createPull, getRepo, issueJson, keyOf, listFiles,
   makeRepo, now, pullJson, removeFile, repositories, repositoryJson, scenario, viewer,
   type Repository,
 } from './store.ts';
-import { commitParents, commitTree } from './git.ts';
+import { commitParents, commitTree, gitObjectHash } from './git.ts';
 
 type JsonSender = (response: ServerResponse, status: number, body: any, headers?: Record<string, string>) => void;
 type ErrorSender = (response: ServerResponse, status: number, message: string) => void;
@@ -93,7 +93,7 @@ function contents(repo: Repository, pathPartsValue: string[], method: string, ur
   if (method === 'PUT') {
     const current = files.get(path), data = Buffer.from(body.content || '', 'base64');
     if (body.sha && current && body.sha !== current || body.sha && !current) return fail(res, 409, 'sha does not match');
-    const sha = contentHash(data), commit = updateContent(repo, path, data, body.message || 'Update ' + path, branch);
+    const sha = gitObjectHash('blob', data), commit = updateContent(repo, path, data, body.message || 'Update ' + path, branch);
     return send(res, current ? 200 : 201, { content: { name: path.split('/').pop(), path, sha, size: data.length, encoding: 'base64' }, commit: { sha: commit } });
   }
   if (method === 'DELETE') {
