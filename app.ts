@@ -1,129 +1,99 @@
-import {createServer,type Server,type IncomingMessage,type ServerResponse} from 'node:http';
-import {createHash} from 'node:crypto';
-import {inflateSync,deflateSync} from 'node:zlib';
-import {buildScenario} from './lib/wire.ts';
-type Obj={type:string,data:Buffer}; type Repo={owner:string,name:string,id:number,description:string,private:boolean,refs:Map<string,string>,objects:Map<string,Obj>,branches:Map<string,string>,issues:any[],pulls:any[],labels:any[],comments:Map<number,any[]>,files:Map<string,{data:Buffer,sha:string}>};
-const scenario=buildScenario(), userLogin=scenario.viewer.login;
-const token=process.env.MAKEFUN_SHOP_TOKEN||'', now=process.env.MAKEFUN_TRIAL_NOW||'2025-01-01T00:00:00Z', repos=new Map<string,Repo>();let serial=1,requestId=0;
-const key=(o:string,r:string)=>((o||'')+'').toLowerCase()+'/'+((r||'')+'').toLowerCase(), hash=(b:Buffer|string)=>createHash('sha1').update(b).digest('hex'), get=(o:string,r:string)=>repos.get(key(o,r));
-function makeRepo(o:string,n:string,b:any={}):Repo{let r:Repo={owner:o,name:n,id:serial++,description:b.description||'',private:!!b.private,refs:new Map(),objects:new Map(),branches:new Map(),issues:[],pulls:[],labels:[],comments:new Map(),files:new Map()};repos.set(key(o,n),r);return r;}
-function send(res:ServerResponse,s:number,b:any,h:any={}){let t=s===204?'':JSON.stringify(b);res.writeHead(s,{'content-type':'application/json; charset=utf-8','x-github-request-id':'MF'+(++requestId).toString(36),...h,...(t?{'content-length':Buffer.byteLength(t)}:{})});res.end(t);}function error(res:ServerResponse,s:number,m:string){send(res,s,{message:m});}
-function pkt(v:string|Buffer){let b=Buffer.isBuffer(v)?v:Buffer.from(v);return Buffer.concat([Buffer.from((b.length+4).toString(16).padStart(4,'0')),b]);}const flush=()=>Buffer.from('0000');
-function parsePkts(b:Buffer){let out:any[]=[],i=0;while(i+4<=b.length){let n=parseInt(b.toString('ascii',i,i+4),16);i+=4;if(!n){out.push({flush:true});continue}if(n===1){out.push({delim:true});continue}if(n===2){out.push({end:true});continue}if(n<4||i+n-4>b.length)break;out.push({data:b.subarray(i,i+n-4)});i+=n-4;}return {out,offset:i};}
-function objHash(t:string,d:Buffer){return hash(Buffer.concat([Buffer.from(t+' '+d.length+'\0'),d]));}function parents(o?:Obj){return o?.type==='commit'?[...o.data.toString().matchAll(/^parent ([a-f0-9]{40})/gm)].map(x=>x[1]):[];}
-function treeOf(r:Repo,c:string){return r.objects.get(c)?.data.toString().match(/^tree ([a-f0-9]{40})/m)?.[1]||'';}
-function readPack(b:Buffer){let m=new Map<string,Obj>(),p=12;if(b.length<32||b.toString('ascii',0,4)!=='PACK')return m;for(let i=0;i<b.readUInt32BE(8);i++){let c=b[p++],t=(c>>4)&7,n=c&15,sh=4;while(c&128){c=b[p++];n|=(c&127)<<sh;sh+=7;}if(t===6){c=b[p++];while(c&128)c=b[p++];}if(t===7)p+=20;let z=inflateSync(b.subarray(p),{info:true}) as any,d:Buffer=z.buffer;p+=z.engine.bytesWritten;let type=({1:'commit',2:'tree',3:'blob',4:'tag'} as any)[t];if(type){let data=d.subarray(0,n);m.set(objHash(type,data),{type,data});}}return m;}
-function writePack(a:Obj[]){let h=Buffer.alloc(12);h.write('PACK');h.writeUInt32BE(2,4);h.writeUInt32BE(a.length,8);let v=[h];for(let o of a){let t=({commit:1,tree:2,blob:3,tag:4} as any)[o.type],n=o.data.length,x=[(t<<4)|(n&15)];n>>=4;while(n){x[x.length-1]|=128;x.push(n&127);n>>=7;}v.push(Buffer.from(x),deflateSync(o.data));}let b=Buffer.concat(v);return Buffer.concat([b,createHash('sha1').update(b).digest()]);}
-function listFiles(r:Repo,t:string,p='',out=new Map<string,string>()):Map<string,string>{let o=r.objects.get(t);if(!o||o.type!=='tree')return out;let b=o.data,i=0;while(i<b.length){let s=b.indexOf(32,i),z=b.indexOf(0,s),n=b.toString('utf8',s+1,z),h=b.subarray(z+1,z+21).toString('hex'),mode=b.toString('ascii',i,s);i=z+21;if(mode==='40000')listFiles(r,h,p+n+'/',out);else out.set(p+n,h);}return out;}
-function buildTree(r:Repo,f:Map<string,string>):string{let direct:any[]=[],dirs=new Map<string,Map<string,string>>();for(let [p,h] of f){let i=p.indexOf('/');if(i<0)direct.push({n:p,h,mode:'100644'});else{let n=p.slice(0,i),m=dirs.get(n)||new Map();m.set(p.slice(i+1),h);dirs.set(n,m);}}for(let [n,m]of dirs)direct.push({n,h:buildTree(r,m),mode:'40000'});direct.sort((a,b)=>a.n.localeCompare(b.n));let d=Buffer.concat(direct.map(x=>Buffer.concat([Buffer.from(x.mode+' '+x.n+'\0'),Buffer.from(x.h,'hex')]))),h=objHash('tree',d);r.objects.set(h,{type:'tree',data:d});return h;}
-function makeCommit(r:Repo,msg:string,tree:string,parent='',br='main'){let d=Buffer.from('tree '+tree+'\n'+(parent?'parent '+parent+'\n':'')+'author Forge <forge@example.invalid> 1735689600 +0000\ncommitter Forge <forge@example.invalid> 1735689600 +0000\n\n'+msg+'\n'),h=objHash('commit',d);r.objects.set(h,{type:'commit',data:d});r.refs.set('refs/heads/'+br,h);r.branches.set(br,h);return h;}
-function contentCommit(r:Repo,path:string,d:Buffer,msg:string,br='main'){let old=r.branches.get(br)||'',f=listFiles(r,treeOf(r,old)),bh=objHash('blob',d);r.objects.set(bh,{type:'blob',data:d});f.set(path,bh);let h=makeCommit(r,msg,buildTree(r,f),old,br);r.files.set(path,{data:d,sha:bh});return h;}
-function deleteFile(r:Repo,path:string,msg:string,br='main'){let old=r.branches.get(br)||'',f=listFiles(r,treeOf(r,old));f.delete(path);let h=makeCommit(r,msg,buildTree(r,f),old,br);r.files.delete(path);return h;}
-function repoJson(r:Repo){return {id:r.id,node_id:Buffer.from('Repository:'+r.id).toString('base64'),name:r.name,full_name:r.owner+'/'+r.name,owner:{login:r.owner},private:r.private,description:r.description,default_branch:'main',has_issues:true,hasIssuesEnabled:true,created_at:now,updated_at:now};}
-function issueJson(r:Repo,i:any){return {...i,node_id:Buffer.from('Issue:'+r.id+':'+i.number).toString('base64'),user:{login:r.owner},created_at:now,updated_at:now,closed_at:i.state==='closed'?now:null};}function pullJson(r:Repo,p:any){return {...p,node_id:Buffer.from('PullRequest:'+r.id+':'+p.number).toString('base64'),head:{ref:p.head,sha:p.headsha,user:{login:r.owner},repo:repoJson(r)},base:{ref:p.base,sha:p.basesha,user:{login:r.owner},repo:repoJson(r)},merged:p.state==='closed',mergeable_state:p.mergeable?'clean':'dirty',merged_at:p.state==='closed'?now:null,created_at:now,updated_at:now};}
-function addIssue(r:Repo,b:any){let i={id:serial++,number:r.issues.length+1,title:String(b.title||''),body:String(b.body||''),state:'open',labels:[],comments:0};for(let x of b.labels||[]){let n=typeof x==='string'?x:x.name,l=r.labels.find(y=>y.name===n);if(l)i.labels.push(l);}r.issues.push(i);return i;}
-function rest(req:IncomingMessage,res:ServerResponse,u:URL,b:any,p:string[],user:string){let m=req.method||'GET',origin='http://'+(req.headers.host||'localhost');if(!p.length)return send(res,200,{current_user_url:'/api/v3/user',rate_limit_url:'/api/v3/rate_limit'},{'x-oauth-scopes':'repo, read:org'});if(p[0]==='meta')return send(res,200,{installed_version:'3.0.0'});if(p[0]==='user') {if(!p[1])return send(res,200,{login:user,id:scenario.viewer.id});if(p[1]==='repos'){if(m==='POST'){if(!b?.name)return error(res,422,'name is required');if(get(user,b.name))return error(res,422,'name already exists');return send(res,201,repoJson(makeRepo(user,b.name,b)));}if(m==='GET'){let a=[...repos.values()].filter(r=>r.owner===user),pg=+(u.searchParams.get('page')||1),per=Math.min(100,+(u.searchParams.get('per_page')||30)),h:any={};if(pg*per<a.length)h.link='<'+origin+'/api/v3/user/repos?per_page='+per+'&page='+(pg+1)+'>; rel="next"';return send(res,200,a.slice((pg-1)*per,pg*per).map(repoJson),h);}}}
-if(p.length<2)return error(res,404,'Not Found');let [,o,n,...t]=p,r=get(o,n);if(!r||o!==user)return error(res,404,'Not Found');if(!t.length){if(m==='GET')return send(res,200,repoJson(r));if(m==='PATCH'){if('description'in(b||{}))r.description=b.description;return send(res,200,repoJson(r));}if(m==='DELETE'){repos.delete(key(o,n));return send(res,204,null);}return error(res,405,'Method Not Allowed');}
-if(t[0]==='branches'&&m==='GET')return send(res,200,[...r.branches].map(([name,sha])=>({name,commit:{sha}})));if(t[0]==='commits'&&m==='GET'){let ref=u.searchParams.get('sha')||'main',c=r.branches.get(ref)||r.refs.get('refs/heads/'+ref),a:any[]=[],seen=new Set();while(c&&!seen.has(c)&&a.length<100){seen.add(c);let ob=r.objects.get(c);if(!ob)break;let s=ob.data.toString();a.push({sha:c,commit:{message:s.split('\n\n').slice(1).join('\n\n').trim()},parents:parents(ob).map(sha=>({sha}))});c=parents(ob)[0];}return send(res,200,a);}
-if(t[0]==='git'&&t[1]==='refs'&&m==='POST'){let ref=String(b.ref||'refs/heads/main'),sha=b.sha||b.object?.sha;if(!ref.startsWith('refs/'))ref='refs/heads/'+ref;if(!sha)return error(res,422,'sha required');r.refs.set(ref,sha);if(ref.startsWith('refs/heads/'))r.branches.set(ref.slice(11),sha);return send(res,201,{ref,object:{sha,type:'commit'}});}
-if(t[0]==='contents'){let path=decodeURIComponent(t.slice(1).join('/'));let br=(b&&b.branch)||u.searchParams.get('ref')||'main',tip=r.branches.get(br)||r.refs.get('refs/heads/'+br)||r.branches.get('main')||'',files=listFiles(r,treeOf(r,tip));if(m==='GET'){let h=files.get(path);if(h){let data=r.objects.get(h)?.data||Buffer.alloc(0);return send(res,200,{name:path.split('/').pop(),path,sha:h,size:data.length,type:'file',encoding:'base64',content:data.toString('base64')});}let pre=path?path+'/':'',a=[...files].filter(([k])=>k.startsWith(pre)&&!k.slice(pre.length).includes('/')).map(([k,sh])=>({name:k.slice(pre.length),path:k,sha:sh,size:(r.objects.get(sh)?.data||Buffer.alloc(0)).length,type:'file'}));return a.length?send(res,200,a):error(res,404,'Not Found');}if(m==='PUT'){let cur=files.get(path),d=Buffer.from(b.content||'','base64');if(b.sha&&cur&&b.sha!==cur||b.sha&&!cur)return error(res,409,'sha does not match');let h=objHash('blob',d),c=contentCommit(r,path,d,b.message||'Update '+path,br);return send(res,cur?200:201,{content:{name:path.split('/').pop(),path,sha:h,size:d.length,encoding:'base64'},commit:{sha:c}});}if(m==='DELETE'){if(!files.has(path))return error(res,404,'Not Found');return send(res,200,{commit:{sha:deleteFile(r,path,b.message||'Delete '+path,br)}});}}
-if(t[0]==='labels'){if(m==='POST'){let l={id:serial++,name:String(b.name||''),color:b.color||'ededed',description:b.description||null};r.labels.push(l);return send(res,201,l);}return send(res,200,r.labels);}
-if(t[0]==='issues'){if(t.length===1){if(m==='POST'){if((b.labels||[]).some((x:any)=>!r.labels.some(l=>l.name===(typeof x==='string'?x:x.name))))return send(res,422,{message:'Validation Failed',errors:[{field:'labels'}]});return send(res,201,issueJson(r,addIssue(r,b)));}if(m==='GET'){let s=u.searchParams.get('state')||'open',a=r.issues.filter(i=>s==='all'||i.state===s),d=u.searchParams.get('direction')||'desc';if(u.searchParams.get('sort')==='created')a=a.slice().sort((x,y)=>(x.number-y.number)*(d==='asc'?1:-1));return send(res,200,a.map(i=>issueJson(r,i)));}}let i=r.issues.find(x=>x.number===+t[1]);if(!i)return error(res,404,'Not Found');if(t[2]==='comments'){let a=r.comments.get(i.number)||[];if(m==='POST'){let c={id:serial++,body:b.body||'',user:{login:user},created_at:now};a.push(c);r.comments.set(i.number,a);i.comments++;return send(res,201,c);}return send(res,200,a);}if(m==='GET')return send(res,200,issueJson(r,i));if(m==='PATCH'){if(b.state)i.state=b.state;return send(res,200,issueJson(r,i));}}
-if(t[0]==='pulls'){if(t.length===1){if(m==='POST'){let head=String(b.head||''),base=String(b.base||'main'),hs=r.branches.get(head)||r.refs.get('refs/heads/'+head)||'',bs=r.branches.get(base)||r.refs.get('refs/heads/'+base)||'',p:any={id:serial++,number:r.pulls.length+1,title:b.title||'',body:b.body||'',state:'open',head,base,headsha:hs,basesha:bs,mergeable:true,merge_commit_sha:null,files:[]};let a=listFiles(r,treeOf(r,hs)),z=listFiles(r,treeOf(r,bs));for(let [path,h] of a)if(z.get(path)!==h)p.files.push({filename:path,status:z.has(path)?'modified':'added',additions:1,deletions:0,changes:1,patch:'@@ -0,0 +1 @@'});r.pulls.push(p);return send(res,201,pullJson(r,p));}if(m==='GET'){let s=u.searchParams.get('state')||'open';return send(res,200,r.pulls.filter(x=>s==='all'||x.state===s).map(x=>pullJson(r,x)));}}let p1=r.pulls.find(x=>x.number===+t[1]);if(!p1)return error(res,404,'Not Found');if(t[2]==='files')return send(res,200,p1.files);if(t[2]==='merge'&&m==='PUT'){let baseTip=r.branches.get(p1.base)||r.refs.get('refs/heads/'+p1.base)||p1.basesha;let baseNow=listFiles(r,treeOf(r,baseTip)),headFiles=listFiles(r,treeOf(r,p1.headsha)),atBase=listFiles(r,treeOf(r,p1.basesha));let prChanged=[...headFiles].filter(([path,h])=>atBase.get(path)!==h).map(([path])=>path);let conflict=baseTip&&baseTip!==p1.basesha&&prChanged.some(path=>baseNow.has(path)&&baseNow.get(path)!==atBase.get(path));if(conflict||!p1.mergeable)return error(res,405,'Pull Request is not mergeable');let merged=new Map(baseNow);for(let [path,h] of headFiles)merged.set(path,h);let tree=buildTree(r,merged),h=makeCommit(r,p1.title+' (#'+p1.number+')',tree,baseTip,p1.base||'main');p1.state='closed';p1.mergeable=false;p1.merge_commit_sha=h;p1.basesha=baseTip;return send(res,200,{sha:h,merged:true,message:'Pull Request successfully merged'});}if(m==='GET')return send(res,200,pullJson(r,p1));}return error(res,404,'Not Found');}
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { gitFetch, gitPush, gitRefs, gitUploadV2 } from './lib/git.ts';
+import { handleGraphqlBody } from './lib/graphql.ts';
+import { handleMcpBody } from './lib/mcp.ts';
+import { handleRest } from './lib/rest.ts';
+import { getRepo, token, viewer } from './lib/store.ts';
 
-function seedRepos(){for(let s of scenario.repos){let r=makeRepo(userLogin,s.name,{description:s.description});r.id=s.id;r.default_branch=s.defaultBranch;} }
-seedRepos();
-function gitRefs(r:Repo,service:string,v2:boolean){if(service==='git-receive-pack'){let caps='report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=git/2.43.0';let first=r.refs.size?[...r.refs].find(([k])=>k.startsWith('refs/')):null;let data=first?pkt(first[1]+' '+first[0]+'\0'+caps+'\n'):pkt('0'.repeat(40)+' capabilities^{}\0'+caps+'\n');return Buffer.concat([pkt('# service=git-receive-pack\n'),flush(),data,flush()]);}if(v2)return Buffer.concat([pkt('version 2\n'),pkt('agent=git/2.43.0\n'),pkt('ls-refs=unborn\n'),pkt('fetch=shallow wait-for-done\n'),pkt('object-format=sha1\n'),flush()]);let caps='multi_ack_detailed side-band-64k ofs-delta shallow no-progress agent=git/2.43.0 symref=HEAD:refs/heads/main object-format=sha1';let a=[...r.refs].filter(([n])=>n.startsWith('refs/'));let out:Buffer[]=[pkt('# service=git-upload-pack\n')];if(!a.length)out.push(pkt('0'.repeat(40)+' capabilities^{}\0'+caps+'\n'));else a.forEach(([n,h],i)=>out.push(pkt(h+' '+n+(i===0?'\0'+caps:'')+'\n')));out.push(flush());return Buffer.concat(out);}
-function reachable(r:Repo,tip:string,depth=0,skip=new Set<string>(),shallow=new Set<string>(),stopShallow=false){let out:Obj[]=[],seen=new Set<string>(),stack:[string,number][]=[[tip,0]];while(stack.length){let [h,d]=stack.pop()!;if(seen.has(h))continue;seen.add(h);let o=r.objects.get(h);if(!o)continue;if(!skip.has(h))out.push(o);if(o.type==='commit'){let tr=treeOf(r,h);if(tr)stack.push([tr,d]);if(!stopShallow||!shallow.has(h)){if(!depth||d<depth-1)for(let p of parents(o))if(!shallow.has(p))stack.push([p,d+1]);}}else if(o.type==='tag'){let tg=o.data.toString().match(/^object ([a-f0-9]{40})/m)?.[1];if(tg)stack.push([tg,d]);}else if(o.type==='tree'){let b=o.data,i=0;while(i<b.length){let s=b.indexOf(32,i),z=b.indexOf(0,s),oid=b.subarray(z+1,z+21).toString('hex');i=z+21;stack.push([oid,d]);}}}return out;}
-function gitFetch(r:Repo,b:Buffer,v2:boolean){let pp=parsePkts(b),lines=pp.out.filter(x=>x.data).map(x=>x.data.toString()),wants=lines.map((s:string)=>s.match(/want ([a-f0-9]{40})/)?.[1]).filter(Boolean) as string[],depth=+(lines.map((s:string)=>s.match(/deepen (\d+)/)?.[1]).find(Boolean)||0),haves=lines.map((s:string)=>s.match(/^have ([a-f0-9]{40})/)?.[1]).filter(Boolean) as string[],caps=lines.map((s:string)=>s.match(/^shallow ([a-f0-9]{40})/)?.[1]).filter(Boolean) as string[];
-if(!wants.length)return Buffer.from('');
-// The client's have-set must stop at its own shallow boundary: it does not hold a boundary commit's parents.
-let shallowSet=new Set(caps),haveSet=new Set<string>();
-for(let h of haves)for(let o of reachable(r,h,0,new Set<string>(),shallowSet,true))haveSet.add(objHash(o.type,o.data));
-let objs:Obj[]=[],seen=new Set<string>();for(let w of wants)for(let o of reachable(r,w,depth,haveSet)){let id=objHash(o.type,o.data);if(!seen.has(id)){seen.add(id);objs.push(o);}}
-let pack=writePack(objs),chunks:Buffer[]=[];
-if(v2){chunks.push(pkt('acknowledgments\n'),pkt(haves.length?'ACK '+haves[0]+'\n':'NAK\n'),flush());
-let info:Buffer[]=[pkt('shallow-info\n')];
-if(depth){let newBoundary:string[]=[];for(let w of wants){let c=w,d=0;while(c&&d<depth-1){c=parents(r.objects.get(c))[0]||'';d++;}if(c&&!shallowSet.has(c))newBoundary.push(c);}
-for(let s of shallowSet)info.push(pkt('unshallow '+s+'\n'));for(let s of newBoundary)info.push(pkt('shallow '+s+'\n'));}
-if(info.length>1){chunks.push(...info,flush());}
-chunks.push(pkt('packfile\n'));}
-for(let i=0;i<pack.length;i+=65515)chunks.push(pkt(Buffer.concat([Buffer.from([1]),pack.subarray(i,Math.min(i+65515,pack.length))])));chunks.push(flush());return Buffer.concat(chunks);}
-function lsRefsV2(r:Repo,lines:string[]){let prefixes:string[]=[],peel=false,symrefs=false;for(let s of lines){s=s.trim();if(s.startsWith('ref-prefix '))prefixes.push(s.slice(11));else if(s==='peel')peel=true;else if(s==='symrefs')symrefs=true;}
-let keep=(n:string)=>prefixes.length===0||prefixes.some(p=>n.startsWith(p)),out:Buffer[]=[],head=r.branches.get('main')||r.refs.get('refs/heads/main')||'';
-if(head&&keep('HEAD'))out.push(pkt(head+' HEAD'+(symrefs?' symref-target:refs/heads/main':'')+'\n'));
-for(let [n,h] of [...r.refs].filter(([nm])=>nm.startsWith('refs/')).sort()){if(!keep(n))continue;let extra='';if(peel&&n.startsWith('refs/tags/')){let o=r.objects.get(h);if(o?.type==='tag'){let tg=o.data.toString().match(/^object ([a-f0-9]{40})/m)?.[1];if(tg)extra=' peeled:'+tg;}}out.push(pkt(h+' '+n+extra+'\n'));}
-out.push(flush());return Buffer.concat(out);}
-function gitUploadV2(r:Repo,b:Buffer){let lines=parsePkts(b).out.filter(x=>x.data).map(x=>x.data.toString());let cmd=lines.map((s:string)=>s.match(/command=(\S+)/)?.[1]).find(Boolean)||'';if(cmd==='ls-refs')return lsRefsV2(r,lines);return gitFetch(r,b,true);}
-function gitPush(r:Repo,b:Buffer){let i=0,commands:string[][]=[];while(i+4<=b.length){let n=parseInt(b.toString('ascii',i,i+4),16);i+=4;if(!n)break;if(n<4||i+n-4>b.length)break;let s=b.subarray(i,i+n-4).toString().split('\0')[0].trim();if(s)commands.push(s.split(' '));i+=n-4;}let pack=b.subarray(i),newObjs=pack.length>20?readPack(pack):new Map<string,Obj>();for(let [h,o]of newObjs)r.objects.set(h,o);let lines=['unpack ok'];for(let [old,nw,ref]of commands){let cur=r.refs.get(ref)||'0'.repeat(40);if(cur!==old){lines.push('ng '+ref+' old oid mismatch');continue;}if(nw==='0'.repeat(40)){r.refs.delete(ref);if(ref.startsWith('refs/heads/'))r.branches.delete(ref.slice(11));lines.push('ok '+ref);continue;}if(!isAncestor(r,old,nw)){lines.push('ng '+ref+' non-fast-forward');continue;}if(!r.objects.has(nw)){lines.push('ng '+ref+' missing object');continue;}r.refs.set(ref,nw);if(ref.startsWith('refs/heads/'))r.branches.set(ref.slice(11),nw);lines.push('ok '+ref);}let rep=Buffer.concat(lines.map(x=>pkt(x+'\n')).concat([flush()]));return Buffer.concat([pkt(Buffer.concat([Buffer.from([1]),rep])),flush()]);}
-function isAncestor(r:Repo,old:string,nw:string){if(old==='0'.repeat(40))return true;let todo=[nw],seen=new Set<string>();while(todo.length){let h=todo.pop()!;if(h===old)return true;if(seen.has(h))continue;seen.add(h);todo.push(...parents(r.objects.get(h)));}return false;}
+const jsonHeaders = (response: ServerResponse, status: number, body: any, extra: Record<string, string> = {}): void => {
+  const serialized = status === 204 ? '' : JSON.stringify(body);
+  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...extra,
+    ...(serialized ? { 'content-length': Buffer.byteLength(serialized) } : {}) });
+  response.end(serialized);
+};
+const sendError = (response: ServerResponse, status: number, message: string): void => jsonHeaders(response, status, { message });
+const sendBuffer = (response: ServerResponse, status: number, type: string, body: Buffer): void => {
+  response.writeHead(status, { 'content-type': type, 'content-length': body.length }); response.end(body);
+};
 
-const tools=[
-{name:'create_repo',description:'Create a repository',inputSchema:{type:'object',properties:{name:{type:'string'},description:{type:'string'},private:{type:'boolean'}},required:['name']}},
-{name:'get_repo',description:'Get a repository',inputSchema:{type:'object',properties:{owner:{type:'string'},repo:{type:'string'}},required:['owner','repo']}},
-{name:'create_issue',description:'Create an issue',inputSchema:{type:'object',properties:{owner:{type:'string'},repo:{type:'string'},title:{type:'string'},body:{type:'string'}},required:['owner','repo','title']}},
-{name:'list_issues',description:'List issues',inputSchema:{type:'object',properties:{owner:{type:'string'},repo:{type:'string'},state:{type:'string'}},required:['owner','repo']}},
-{name:'create_pull_request',description:'Create a pull request',inputSchema:{type:'object',properties:{owner:{type:'string'},repo:{type:'string'},title:{type:'string'},head:{type:'string'},base:{type:'string'}},required:['owner','repo','title','head','base']}},
-{name:'merge_pull_request',description:'Merge a pull request',inputSchema:{type:'object',properties:{owner:{type:'string'},repo:{type:'string'},pull_number:{type:'integer'}},required:['owner','repo','pull_number']}}
-];
-function mcpResult(obj:any){return {content:[{type:'text',text:JSON.stringify(obj)}],structuredContent:obj};}
-function rpc(req:IncomingMessage,res:ServerResponse,body:any,user:string){let id=body?.id,method=body?.method,params=body?.params||{};if(!body||body.jsonrpc!=='2.0'||!method)return send(res,400,{jsonrpc:'2.0',id:id??null,error:{code:-32600,message:'Invalid Request'}});const reply=(result:any)=>send(res,200,{jsonrpc:'2.0',id,result});const fail=(code:number,message:string)=>send(res,200,{jsonrpc:'2.0',id,error:{code,message}});if(method==='initialize')return reply({protocolVersion:params.protocolVersion||'2025-11-25',capabilities:{tools:{}},serverInfo:{name:'github-forge',version:'1.0.0'}});if(method==='notifications/initialized')return res.writeHead(202).end();if(method==='server/discover')return reply({supportedVersions:['2026-07-28','2025-11-25'],serverInfo:{name:'github-forge',version:'1.0.0'},capabilities:{tools:{}}});if(method==='tools/list')return reply({tools});if(method!=='tools/call')return fail(-32601,'Method not found');let name=params.name,args=params.arguments||{},owner=args.owner||user,repo=args.repo||'',r=get(owner,repo);if(!tools.some(t=>t.name===name))return fail(-32602,'Unknown tool');if(name==='create_repo'){r=get(user,args.name)||makeRepo(user,args.name,{description:args.description,private:args.private});return reply(mcpResult(repoJson(r)));}if(name==='get_repo'){if(!r)return reply({isError:true,content:[{type:'text',text:'Not Found'}]});return reply(mcpResult(repoJson(r)));}if(name==='create_issue'){if(!r||!args.title)return reply({isError:true,content:[{type:'text',text:'Invalid arguments'}]});let x=addIssue(r,args);return reply(mcpResult(issueJson(r,x)));}if(name==='list_issues'){if(!r)return reply({isError:true,content:[{type:'text',text:'Not Found'}]});return reply(mcpResult(r.issues.filter(x=>!args.state||args.state==='all'||x.state===args.state).map(x=>issueJson(r,x))));}if(name==='create_pull_request'){if(!r)return reply({isError:true,content:[{type:'text',text:'Not Found'}]});let p={id:serial++,number:r.pulls.length+1,title:args.title,body:'',state:'open',head:args.head,base:args.base,headsha:r.branches.get(args.head)||r.refs.get('refs/heads/'+args.head)||'',basesha:r.branches.get(args.base)||r.refs.get('refs/heads/'+args.base)||'',mergeable:true,merge_commit_sha:null,files:[]};r.pulls.push(p);return reply(mcpResult(pullJson(r,p)));}if(name==='merge_pull_request'){let p=r?.pulls.find(x=>x.number===+args.pull_number);if(!p)return reply({isError:true,content:[{type:'text',text:'Not Found'}]});let tree=treeOf(r,p.headsha)||treeOf(r,p.basesha),h=makeCommit(r,p.title+' (#'+p.number+')',tree,p.basesha);p.state='closed';p.merge_commit_sha=h;return reply(mcpResult(pullJson(r,p)));}}
+function requestBody(request: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+    request.on('end', () => resolve(Buffer.concat(chunks)));
+    request.on('error', () => resolve(Buffer.alloc(0)));
+  });
+}
+function parseJson(raw: Buffer): { value?: any; invalid: boolean } {
+  if (raw.length === 0) return { value: {}, invalid: false };
+  try { return { value: JSON.parse(raw.toString('utf8')), invalid: false }; }
+  catch { return { invalid: true }; }
+}
+const isAuthorized = (request: IncomingMessage) => (request.headers.authorization || '') === 'Bearer ' + token && token !== '';
+const allowedApiMethod = (method: string) => ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'].includes(method);
 
-function graphqlOne(doc:string,v:any,user:string):any {let data:any={};if(doc.includes('viewer'))data.viewer={login:user};let owner=v.owner||doc.match(/owner:\s*"([^"]+)"/)?.[1]||user,name=v.name||doc.match(/name:\s*"([^"]+)"/)?.[1]||'',r=get(owner,name);if(doc.includes('repository(')){if(!r){data.repository=null;return {data};}let rid=Buffer.from('Repository:'+r.id).toString('base64');let repo:any={id:rid,databaseId:r.id,name:r.name,nameWithOwner:r.owner+'/'+r.name,owner:{login:r.owner},defaultBranchRef:{name:'main'},viewerPermission:'ADMIN',hasIssuesEnabled:true};if(doc.includes('issues(')){let is=r.issues.filter(x=>!doc.includes('CLOSED')?x.state==='open':true);if(doc.includes('direction: DESC'))is.reverse();let first=v.first||10,after=v.after?+(String(v.after).split(':').pop()):0;repo.issues={nodes:is.slice(after,after+first).map(x=>gIssue(r,x,doc)),pageInfo:{hasNextPage:after+first<is.length,endCursor:String(Math.min(after+first,is.length))}};}if(doc.includes('issue(number:')){let n=v.number||+(doc.match(/number:\s*(\d+)/)?.[1]||0),x=r.issues.find(i=>i.number===n);repo.issue=x?gIssue(r,x,doc):null;}if(doc.includes('pullRequests(')){repo.pullRequests={nodes:r.pulls.slice(0,v.first||5).map(p=>gPull(r,p,doc))};}if(doc.includes('pullRequest(number:')){let n=v.number||+(doc.match(/number:\s*(\d+)/)?.[1]||0),p=r.pulls.find(x=>x.number===n);repo.pullRequest=p?gPull(r,p,doc):null;}data.repository=repo;}
-if(doc.includes('createIssue')){let rr=(v.input?.repositoryId&&repoByGid(v.input.repositoryId))||get(user,name)||makeRepo(user,name);let x=addIssue(rr,v.input||{});data.createIssue={issue:{number:x.number,id:Buffer.from('Issue:'+x.id).toString('base64')}};}if(doc.includes('closeIssue')){let i=decodeURIComponent(v.input?.issueId||''),x=[...repos.values()].flatMap(r=>r.issues).find(z=>Buffer.from('Issue:'+z.id).toString('base64')===i);if(x)x.state='closed';data.closeIssue={issue:x?{number:x.number,id:v.input.issueId,state:'CLOSED'}:null};}if(doc.includes('createPullRequest')){let rg=(v.input?.repositoryId&&repoByGid(v.input.repositoryId))||get(user,name)||makeRepo(user,name),a=v.input||{},p:any={id:serial++,number:rg.pulls.length+1,title:a.title||'',body:'',state:'open',head:a.headRefName,base:a.baseRefName,headsha:rg.branches.get(a.headRefName)||'',basesha:rg.branches.get(a.baseRefName)||'',mergeable:true,merge_commit_sha:null,files:[]};rg.pulls.push(p);data.createPullRequest={pullRequest:gPull(rg,p,doc)};}if(doc.includes('mergePullRequest')){let a=v.input||{},p=[...repos.values()].flatMap(r=>r.pulls).find(x=>Buffer.from('PullRequest:'+x.id).toString('base64')===a.pullRequestId);if(p){p.state='closed';p.merge_commit_sha='';}data.mergePullRequest={pullRequest:p?{number:p.number,merged:true,state:'MERGED'}:null};}if(doc.includes('addComment')){let a=v.input||{},c={id:Buffer.from('IssueComment:'+(serial++)).toString('base64'),body:a.body||''};data.addComment={commentEdge:{node:c}};let q=[...repos.values()].flatMap(r=>r.issues).find(x=>Buffer.from('Issue:'+x.id).toString('base64')===a.subjectId);if(q){let r=[...repos.values()].find(x=>x.issues.includes(q))!,list=r.comments.get(q.number)||[];list.push({id:serial++,body:c.body,user:{login:user},created_at:now});r.comments.set(q.number,list);}}
-if(doc.includes('__type')){let re=/(\w+)\s*:\s*__type\(name:\s*"([^"]+)"/g,mm:RegExpExecArray|null;while((mm=re.exec(doc))){let alias=mm[1],ty=mm[2],fl=(GQL_FIELDS[ty]||['id','number','title','state','body']).map(nm=>({name:nm}));data[alias]={name:ty,fields:fl,...(ty==='SearchType'?{enumValues:['ISSUE','REPOSITORY','USER','DISCUSSION'].map(nm=>({name:nm}))}:{})};}}if(doc.includes('node(id:')){let idv=v.id;let repo=[...repos.values()].find(x=>Buffer.from('Repository:'+x.id).toString('base64')===idv);data.node=repo?{id:idv,name:repo.name,nameWithOwner:repo.owner+'/'+repo.name}:null;}if(doc.includes('noSuchField'))return {data:{viewer:{login:user}},errors:[{message:'Cannot query field noSuchFieldOnViewer'}]};return {data};}
-function gIssue(r:Repo,i:any,doc:string){return {id:Buffer.from('Issue:'+i.id).toString('base64'),databaseId:i.id,number:i.number,title:i.title,body:i.body,state:i.state.toUpperCase(),labels:{nodes:i.labels},author:{login:r.owner}};}
-function gPull(r:Repo,p:any,doc:string){let o:any={id:Buffer.from('PullRequest:'+p.id).toString('base64'),number:p.number,title:p.title,state:p.state==='open'?'OPEN':'CLOSED',merged:p.state==='closed',headRefName:p.head,baseRefName:p.base,mergeable:p.mergeable?'MERGEABLE':'CONFLICTING'};if(doc.includes('files('))o.files={nodes:p.files.map(f=>({path:f.filename}))};return o;}
-const repoByGid=(id:string)=>[...repos.values()].find(x=>Buffer.from('Repository:'+x.id).toString('base64')===id);
-const GQL_FIELDS:{[k:string]:string[]}={Issue:['id','number','title','body','state','labels','author','comments','repository','createdAt','updatedAt','closedAt'],PullRequest:['id','number','title','body','state','merged','mergeable','headRefName','baseRefName','headRefOid','baseRefOid','files','author','createdAt','updatedAt','closedAt'],Repository:['id','databaseId','name','nameWithOwner','owner','defaultBranchRef','viewerPermission','hasIssuesEnabled','issue','issues','pullRequests','pullRequest','createdAt','updatedAt','description','isPrivate','url']};
-
-/** Read a request body to a Buffer; never throws. */
-function bodyOf(req:IncomingMessage):Promise<Buffer>{return new Promise((ok)=>{const c:any[]=[];req.on('data',(d:any)=>c.push(Buffer.from(d)));req.on('end',()=>ok(Buffer.concat(c)));req.on('error',()=>ok(Buffer.alloc(0)));});}
-function sendBuf(res:ServerResponse,s:number,type:string,b:Buffer){res.writeHead(s,{'content-type':type,'content-length':b.length});res.end(b);}
-function ok401(res:ServerResponse){error(res,401,'Requires authentication');}
-const authed=(req:IncomingMessage)=>{const a=req.headers['authorization']||'';return a===`Bearer ${token}`&&token!=='';};
-function restPath(p:string){return p.replace(/^\/api\/v3\/?/,'').split('/').filter(x=>x!=='').map(decodeURIComponent);}
-
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
-export function createApp(): Server {
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    let url:URL; try{url=new URL(req.url??'/','http://entry');}catch{ return error(res,400,'Bad Request'); }
-    const p=url.pathname, m=req.method??'GET';
-    if(p==='/healthz'&&m==='GET') return send(res,200,{ok:true});
-    // git smart HTTP: /{owner}/{repo}.git/{info/refs,git-upload-pack,git-receive-pack}
-    let gm=p.match(/^\/([^/]+)\/([^/]+?)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/);
-    if(gm){ let owner=gm[1],name=gm[2],sub=gm[3],r=get(owner,name); if(!r)return error(res,404,'Not Found');
-      const v2=(req.headers['git-protocol']||'').includes('version=2');
-      if(sub==='info/refs'){ if(m!=='GET')return error(res,405,'Method Not Allowed'); let service=url.searchParams.get('service')||'git-upload-pack'; let type=`application/x-${service}-advertisement`; return sendBuf(res,200,type,gitRefs(r,service,v2)); }
-      let service=sub, type=`application/x-${service}-result`; let body=await bodyOf(req);
-      let out=service==='git-upload-pack'?(v2?gitUploadV2(r,body):gitFetch(r,body,false)):gitPush(r,body);
-      return sendBuf(res,200,type,out); }
-    // everything under /api/*, /graphql and /mcp needs the bearer token
-    if(!authed(req)) return ok401(res);
-    if(p==='/api/v3'||p.startsWith('/api/v3/')){ if(m!=='GET'&&m!=='POST'&&m!=='PATCH'&&m!=='PUT'&&m!=='DELETE')return error(res,405,'Method Not Allowed'); let b:any=null; if(m!=='GET'){let raw=(await bodyOf(req)).toString('utf8'); if(raw){try{b=JSON.parse(raw);}catch{return error(res,400,'Problems parsing JSON');}}else b={};} return rest(req,res,url,b,restPath(p),userLogin); }
-    if(p==='/api/graphql'){ if(m!=='POST')return error(res,405,'Method Not Allowed'); let raw=(await bodyOf(req)).toString('utf8'); let b:any={}; try{b=raw?JSON.parse(raw):{};}catch{return error(res,400,'Problems parsing JSON');} if(Array.isArray(b))return send(res,200,b.map((op:any)=>typeof op==='object'&&op!==null?graphqlOne(String(op.query??''),op.variables??{},userLogin):{data:null,errors:[{message:'Invalid operation'}]})); let out=graphqlOne(String(b.query??''),b.variables??{},userLogin); return send(res,200,out); }
-    if(p==='/mcp'){ if(m!=='POST')return error(res,405,'Method Not Allowed'); let raw=(await bodyOf(req)).toString('utf8'); let b:any={}; try{b=raw?JSON.parse(raw):{};}catch{return send(res,400,{jsonrpc:'2.0',id:null,error:{code:-32700,message:'Parse error'}});} if(Array.isArray(b)){return send(res,200,b.map((x:any)=>typeof x==='object'&&x!==null?rpcOne(x,userLogin):{jsonrpc:'2.0',id:null,error:{code:-32600,message:'Invalid Request'}}));} return rpc(req,res,b,userLogin); }
-    return error(res,404,'Not Found');
+function gitRoute(request: IncomingMessage, response: ServerResponse, url: URL): Promise<boolean> | boolean {
+  const match = url.pathname.match(/^\/([^/]+)\/([^/]+?)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/);
+  if (!match) return false;
+  const [, owner, name, endpoint] = match;
+  const repo = getRepo(owner!, name!);
+  if (!repo) { sendError(response, 404, 'Not Found'); return true; }
+  const version2 = (request.headers['git-protocol'] || '').includes('version=2');
+  if (endpoint === 'info/refs') {
+    if (request.method !== 'GET') { sendError(response, 405, 'Method Not Allowed'); return true; }
+    const service = url.searchParams.get('service') || 'git-upload-pack';
+    sendBuffer(response, 200, 'application/x-' + service + '-advertisement', gitRefs(repo, service, version2));
+    return true;
+  }
+  return requestBody(request).then((body) => {
+    const payload = endpoint === 'git-upload-pack' ? (version2 ? gitUploadV2(repo, body) : gitFetch(repo, body, false)) : gitPush(repo, body);
+    sendBuffer(response, 200, 'application/x-' + endpoint + '-result', payload);
+    return true;
   });
 }
 
-/** Handle one JSON-RPC request object, returning the reply object (for batch support). */
-function rpcOne(body:any,user:string):any{ let id=body?.id,method=body?.method,params=body?.params||{};
-  if(!body||body.jsonrpc!=='2.0'||typeof method!=='string')return {jsonrpc:'2.0',id:id??null,error:{code:-32600,message:'Invalid Request'}};
-  const reply=(result:any)=>({jsonrpc:'2.0',id,result});
-  const fail=(code:number,message:string)=>({jsonrpc:'2.0',id,error:{code,message}});
-  if(method==='initialize')return reply({protocolVersion:params.protocolVersion||'2025-11-25',capabilities:{tools:{}},serverInfo:{name:'github-forge',version:'1.0.0'}});
-  if(method==='notifications/initialized')return null;
-  if(method==='server/discover')return reply({supportedVersions:['2026-07-28','2025-11-25'],serverInfo:{name:'github-forge',version:'1.0.0'},capabilities:{tools:{}}});
-  if(method==='tools/list')return reply({tools});
-  if(method!=='tools/call')return fail(-32601,'Method not found');
-  let name=params.name,args=params.arguments||{},owner=args.owner||user,repo=args.repo||'',r=get(owner,repo);
-  if(!tools.some(t=>t.name===name))return fail(-32602,'Unknown tool');
-  if(name==='create_repo'){r=get(user,args.name)||makeRepo(user,args.name,{description:args.description,private:args.private});return reply(mcpResult(repoJson(r)));}
-  if(name==='get_repo'){if(!r)return reply({isError:true,content:[{type:'text',text:'Not Found'}]});return reply(mcpResult(repoJson(r)));}
-  if(name==='create_issue'){if(!r||!args.title)return reply({isError:true,content:[{type:'text',text:'Invalid arguments'}]});let x=addIssue(r,args);return reply(mcpResult(issueJson(r,x)));}
-  if(name==='list_issues'){if(!r)return reply({isError:true,content:[{type:'text',text:'Not Found'}]});return reply(mcpResult(r.issues.filter((x:any)=>!args.state||args.state==='all'||x.state===args.state).map((x:any)=>issueJson(r,x))));}
-  if(name==='create_pull_request'){if(!r)return reply({isError:true,content:[{type:'text',text:'Not Found'}]});let pp:any={id:serial++,number:r.pulls.length+1,title:args.title,body:'',state:'open',head:args.head,base:args.base,headsha:r.branches.get(args.head)||r.refs.get('refs/heads/'+args.head)||'',basesha:r.branches.get(args.base)||r.refs.get('refs/heads/'+args.base)||'',mergeable:true,merge_commit_sha:null,files:[]};r.pulls.push(pp);return reply(mcpResult(pullJson(r,pp)));}
-  if(name==='merge_pull_request'){let pp=r?.pulls.find(x=>x.number===+args.pull_number);if(!pp)return reply({isError:true,content:[{type:'text',text:'Not Found'}]});let tree=treeOf(r,pp.headsha)||treeOf(r,pp.basesha),h=makeCommit(r,pp.title+' (#'+pp.number+')',tree,pp.basesha);pp.state='closed';pp.merge_commit_sha=h;return reply(mcpResult(pullJson(r,pp)));}
-  return fail(-32601,'Method not found');
+function apiRoute(request: IncomingMessage, response: ServerResponse, url: URL): Promise<boolean> | boolean {
+  const pathname = url.pathname, method = request.method || 'GET';
+  const isRest = pathname === '/api/v3' || pathname.startsWith('/api/v3/');
+  const isGraphql = pathname === '/api/graphql';
+  const isMcp = pathname === '/mcp';
+  if (!isRest && !isGraphql && !isMcp) return false;
+  if (!isAuthorized(request)) { sendError(response, 401, 'Requires authentication'); return true; }
+  if (isRest) {
+    if (!allowedApiMethod(method)) { sendError(response, 405, 'Method Not Allowed'); return true; }
+    if (method === 'GET') { handleRest(request, response, url, null, jsonHeaders, sendError); return true; }
+    return requestBody(request).then((raw) => {
+      const parsed = parseJson(raw);
+      if (parsed.invalid) { sendError(response, 400, 'Problems parsing JSON'); return true; }
+      handleRest(request, response, url, parsed.value, jsonHeaders, sendError); return true;
+    });
+  }
+  if (method !== 'POST') { sendError(response, 405, 'Method Not Allowed'); return true; }
+  return requestBody(request).then((raw) => {
+    const parsed = parseJson(raw);
+    if (parsed.invalid) {
+      if (isMcp) jsonHeaders(response, 400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+      else sendError(response, 400, 'Problems parsing JSON');
+      return true;
+    }
+    const body = parsed.value;
+    if (isGraphql) jsonHeaders(response, 200, handleGraphqlBody(body));
+    else if (!Array.isArray(body) && body?.method === 'notifications/initialized') response.writeHead(202).end();
+    else jsonHeaders(response, 200, handleMcpBody(body, viewer));
+    return true;
+  });
+}
+
+/** Create the HTTP application without binding; main.ts owns the harness lifecycle and listen call. */
+export function createApp(): Server {
+  return createServer(async (request, response) => {
+    let url: URL;
+    try { url = new URL(request.url || '/', 'http://entry'); }
+    catch { sendError(response, 400, 'Bad Request'); return; }
+
+    if (url.pathname === '/healthz' && request.method === 'GET') { jsonHeaders(response, 200, { ok: true }); return; }
+    if (await gitRoute(request, response, url)) return;
+    if (await apiRoute(request, response, url)) return;
+    sendError(response, 404, 'Not Found');
+  });
 }
